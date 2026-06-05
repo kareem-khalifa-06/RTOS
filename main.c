@@ -5,12 +5,17 @@
 #include "task.h"
 #include "queue.h"
 #include "semphr.h"
-#include <timers.h>
 
 #define DATA_LEN 64
 #define TARGET 2000
+
+#ifndef DROP_PROB
 #define DROP_PROB 0.2f
+#endif
+
+#ifndef TIMEOUT_MS
 #define TIMEOUT_MS 200
+#endif
 
 typedef struct
 {
@@ -31,11 +36,14 @@ typedef struct
 static Stats_t stats = {0};
 static volatile uint8_t simulationDone = 0;
 
+static QueueHandle_t xGenQueue;
 static QueueHandle_t xTxQueue;
 static QueueHandle_t xRxQueue;
 static QueueHandle_t xAckQueue;
 static SemaphoreHandle_t xAckSem;
 static SemaphoreHandle_t xStatsMutex;
+
+static Packet_t currentPkt;
 
 /* ===== ENGINEER 1 — TX ===== */
 
@@ -53,10 +61,35 @@ void vPacketGeneratorTask(void *pvParameters)
         pkt.checksum = seqNum;
         memset(pkt.payload, seqNum & 0xFF, DATA_LEN);
 
-        xQueueSend(xTxQueue, &pkt, portMAX_DELAY);
+        xQueueSend(xGenQueue, &pkt, portMAX_DELAY);
         seqNum++;
     }
 }
+
+void vSenderTask(void *pvParameters)
+{
+    for (;;)
+    {
+        if (simulationDone)
+            vTaskDelete(NULL);
+
+        xQueueReceive(xGenQueue, &currentPkt, portMAX_DELAY);
+
+        xSemaphoreTake(xStatsMutex, portMAX_DELAY);
+        stats.sent++;
+        xSemaphoreGive(xStatsMutex);
+
+        xQueueSend(xTxQueue, &currentPkt, portMAX_DELAY);
+
+        while (xSemaphoreTake(xAckSem, pdMS_TO_TICKS(TIMEOUT_MS)) == pdFALSE)
+        {
+            stats.retransmitted++;
+            stats.timeouts++;
+            xQueueSend(xTxQueue, &currentPkt, portMAX_DELAY);
+        }
+    }
+}
+
 void vLinkSimTask(void *pvParameters)
 {
     Packet_t pkt;
@@ -71,78 +104,96 @@ void vLinkSimTask(void *pvParameters)
         float r = (float)rand() / (float)RAND_MAX;
         if (r < DROP_PROB)
         {
-            /* Packet dropped — update stats */
-            xSemaphoreTake(xStatsMutex, portMAX_DELAY);
             stats.dropped++;
-            xSemaphoreGive(xStatsMutex);
         }
         else
         {
-            /* Packet survives — forward to receiver */
             xQueueSend(xRxQueue, &pkt, portMAX_DELAY);
         }
     }
 }
-/* Priority: 2 */
-/* ===== SENDER FSM ===== */
 
-static TimerHandle_t xRetxTimer;
-static Packet_t currentPkt; /* packet in flight */
+/* ===== ENGINEER 2 — RX ===== */
 
-void vRetxTimerCallback(TimerHandle_t xTimer)
+void vReceiverTask(void *pvParameters)
 {
-    /* Timeout fired — retransmit */
-    xSemaphoreTake(xStatsMutex, portMAX_DELAY);
-    stats.retransmitted++;
-    stats.timeouts++;
-    xSemaphoreGive(xStatsMutex);
-
-    xQueueSend(xTxQueue, &currentPkt, 0); /* re-inject into link */
-    xTimerStart(xRetxTimer, 0);           /* restart timer */
-}
-
-void vSenderTask(void *pvParameters)
-{
-    xRetxTimer = xTimerCreate(
-        "RetxTimer",
-        pdMS_TO_TICKS(TIMEOUT_MS),
-        pdFALSE, /* one-shot */
-        NULL,
-        vRetxTimerCallback);
-    configASSERT(xRetxTimer);
+    Packet_t pkt;
+    uint16_t expectedSeq = 0;
 
     for (;;)
     {
         if (simulationDone)
             vTaskDelete(NULL);
 
-        /* Grab next packet from generator */
-        xQueueReceive(xTxQueue, &currentPkt, portMAX_DELAY);
+        xQueueReceive(xRxQueue, &pkt, portMAX_DELAY);
 
-        xSemaphoreTake(xStatsMutex, portMAX_DELAY);
-        stats.sent++;
-        xSemaphoreGive(xStatsMutex);
+        if (pkt.seqNum == expectedSeq)
+        {
+            xSemaphoreTake(xStatsMutex, portMAX_DELAY);
+            stats.received++;
+            uint32_t rcvd = stats.received;
+            xSemaphoreGive(xStatsMutex);
 
-        /* Forward to link sim and start timeout */
-        xQueueSend(xTxQueue, &currentPkt, portMAX_DELAY);
-        xTimerStart(xRetxTimer, 0);
+            xQueueSend(xAckQueue, &pkt.seqNum, 0);
+            expectedSeq++;
 
-        /* Block until ACK relay gives the semaphore */
-        xSemaphoreTake(xAckSem, portMAX_DELAY);
-        xTimerStop(xRetxTimer, 0);
+            if (rcvd >= TARGET)
+            {
+                simulationDone = 1;
+            }
+        }
+        /* duplicates silently discarded */
     }
 }
-/* Priority: 3 */
-/* Priority: 1 */
+
+void vAckRelayTask(void *pvParameters)
+{
+    uint16_t ackSeq;
+
+    for (;;)
+    {
+        if (simulationDone)
+            vTaskDelete(NULL);
+
+        xQueueReceive(xAckQueue, &ackSeq, portMAX_DELAY);
+        xSemaphoreGive(xAckSem);
+    }
+}
+
+void vStatsPrinterTask(void *pvParameters)
+{
+    while (!simulationDone)
+        vTaskDelay(pdMS_TO_TICKS(100));
+
+    vTaskDelay(pdMS_TO_TICKS(200));
+
+    xSemaphoreTake(xStatsMutex, portMAX_DELAY);
+    printf("\n===== SIMULATION COMPLETE =====\n");
+    printf("STATS: %u,%u,%u,%u,%u\n",
+           stats.sent, stats.received,
+           stats.dropped, stats.retransmitted, stats.timeouts);
+    printf("Sent:          %u\n", stats.sent);
+    printf("Received:      %u\n", stats.received);
+    printf("Dropped:       %u\n", stats.dropped);
+    printf("Retransmitted: %u\n", stats.retransmitted);
+    printf("Timeouts:      %u\n", stats.timeouts);
+    printf("Drop rate:     %.1f%%\n",
+           100.0f * stats.dropped / (stats.dropped + stats.received));
+    xSemaphoreGive(xStatsMutex);
+
+    exit(0);
+}
+
 int main(void)
 {
-
+    xGenQueue = xQueueCreate(10, sizeof(Packet_t));
     xTxQueue = xQueueCreate(10, sizeof(Packet_t));
     xRxQueue = xQueueCreate(10, sizeof(Packet_t));
     xAckQueue = xQueueCreate(10, sizeof(uint16_t));
     xAckSem = xSemaphoreCreateBinary();
     xStatsMutex = xSemaphoreCreateMutex();
 
+    configASSERT(xGenQueue);
     configASSERT(xTxQueue);
     configASSERT(xRxQueue);
     configASSERT(xAckQueue);
@@ -152,6 +203,10 @@ int main(void)
     xTaskCreate(vPacketGeneratorTask, "Gen", 512, NULL, 1, NULL);
     xTaskCreate(vSenderTask, "Sender", 512, NULL, 3, NULL);
     xTaskCreate(vLinkSimTask, "Link", 512, NULL, 2, NULL);
+    xTaskCreate(vReceiverTask, "RX", 512, NULL, 2, NULL);
+    xTaskCreate(vAckRelayTask, "ACK", 512, NULL, 3, NULL);
+    xTaskCreate(vStatsPrinterTask, "Stats", 512, NULL, 1, NULL);
+
     vTaskStartScheduler();
     return 0;
 }

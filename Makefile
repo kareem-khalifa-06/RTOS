@@ -3,8 +3,9 @@ KERNEL = FreeRTOS-Kernel
 PORT   = $(KERNEL)/portable/ThirdParty/GCC/Posix
 MEM    = $(KERNEL)/portable/MemMang
 
-DROP_PROB  ?= 0.2
+DROP_PROB  ?= 0.01
 TIMEOUT_MS ?= 200
+TARGET     ?= 2000
 
 SRCS = main.c \
        $(KERNEL)/tasks.c \
@@ -18,7 +19,8 @@ SRCS = main.c \
 
 INCLUDES = -I$(KERNEL)/include -I$(PORT) -I.
 CFLAGS   = -Wall -O0 -g $(INCLUDES) -lpthread -lrt \
-           -DDROP_PROB=$(DROP_PROB)f -DTIMEOUT_MS=$(TIMEOUT_MS)
+           -DDROP_PROB=$(DROP_PROB)f -DTIMEOUT_MS=$(TIMEOUT_MS) \
+           -DTARGET=$(TARGET)
 
 demo: $(SRCS)
 	$(CC) $(CFLAGS) -o demo $(SRCS)
